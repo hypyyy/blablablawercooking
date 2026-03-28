@@ -1,6 +1,5 @@
 /**
  * eBay UK scraper API — Playwright headless Chromium
- * Deployed as a standalone service on Railway
  */
 
 import express from "express";
@@ -12,13 +11,11 @@ const app = express();
 app.use(cors());
 
 let browser = null;
+let queue = Promise.resolve();
 
 async function getBrowser() {
   if (!browser || !browser.isConnected()) {
-    if (browser) {
-      try { await browser.close(); } catch {}
-      browser = null;
-    }
+    if (browser) { try { await browser.close(); } catch {} browser = null; }
     browser = await chromium.launch({
       headless: true,
       args: [
@@ -36,18 +33,10 @@ async function getBrowser() {
   return browser;
 }
 
-async function scrapeEbay(url, retry = true) {
-  let b;
-  try {
-    b = await getBrowser();
-  } catch (err) {
-    browser = null;
-    if (retry) return scrapeEbay(url, false);
-    throw err;
-  }
+async function scrapeEbay(url) {
+  const b = await getBrowser();
   const context = await b.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     locale: "en-GB",
     viewport: { width: 1280, height: 800 },
     extraHTTPHeaders: { "Accept-Language": "en-GB,en;q=0.9" },
@@ -64,48 +53,39 @@ async function scrapeEbay(url, retry = true) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForSelector("ul.srp-results", { timeout: 10000 }).catch(() => {});
 
-    const listings = await page.evaluate(() => {
+    return await page.evaluate(() => {
       const results = [];
       document.querySelectorAll("ul.srp-results > li").forEach((el) => {
-        const title = el.querySelector(".s-card__title span")?.textContent
-          ?.replace("New listing", "")?.trim();
+        const title = el.querySelector(".s-card__title span")?.textContent?.replace("New listing", "")?.trim();
         if (!title || title === "Shop on eBay") return;
-
         const priceText = el.querySelector(".s-card__price")?.textContent || "";
         const priceMatch = priceText.replace(/,/g, "").match(/£([\d]+\.?\d*)/);
         const price = priceMatch ? parseFloat(priceMatch[1]) : null;
         if (!price || price <= 0) return;
-
         const condition = el.querySelector(".s-card__subtitle span")?.textContent?.trim() || "Unknown";
         const attrsText = el.querySelector("[class*=attribute-row]")?.textContent?.toLowerCase() || "";
         const bidsText = el.querySelector("[class*=bid]")?.textContent?.trim() || "";
-
         let type = "BIN";
         if (/\d+\s*bid/i.test(bidsText)) type = "Auction";
         else if (attrsText.includes("best offer")) type = "Best Offer";
-
         const bidsMatch = bidsText.match(/(\d+)/);
         const shipping = el.querySelector("[class*=shipping],[class*=delivery]")?.textContent?.trim() || "Free delivery";
         const location = el.querySelector("[class*=location]")?.textContent?.replace("From ", "")?.trim() || null;
         const date = el.querySelector("[class*=ended],[class*=sold]")?.textContent?.trim() || null;
-
-        results.push({
-          title, price, condition, type,
-          bids: bidsMatch ? parseInt(bidsMatch[1]) : 0,
-          shipping, location, date,
-        });
+        results.push({ title, price, condition, type, bids: bidsMatch ? parseInt(bidsMatch[1]) : 0, shipping, location, date });
       });
       return results;
     });
-
-    return listings;
-  } catch (err) {
-    browser = null;
-    if (retry) return scrapeEbay(url, false);
-    throw err;
   } finally {
     try { await context.close(); } catch {}
   }
+}
+
+// Run all scrapes sequentially to avoid browser crashes under concurrency
+function enqueue(fn) {
+  const result = queue.then(fn).catch((err) => { browser = null; throw err; });
+  queue = result.catch(() => {});
+  return result;
 }
 
 app.get("/api/ebay-search", async (req, res) => {
@@ -118,7 +98,9 @@ app.get("/api/ebay-search", async (req, res) => {
 
   try {
     console.log(`[eBay] Searching: "${q}"`);
-    const [active, sold] = await Promise.all([scrapeEbay(activeUrl), scrapeEbay(soldUrl)]);
+    // Scrape sequentially via queue to keep browser stable
+    const active = await enqueue(() => scrapeEbay(activeUrl));
+    const sold   = await enqueue(() => scrapeEbay(soldUrl));
     console.log(`[eBay] Done: ${active.length} active, ${sold.length} sold`);
     res.json({ keyword: q, active, sold, fetchedAt: new Date().toISOString() });
   } catch (err) {
