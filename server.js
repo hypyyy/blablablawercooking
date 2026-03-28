@@ -3,6 +3,8 @@
  * Deployed as a standalone service on Railway
  */
 
+process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
+
 import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
