@@ -10,46 +10,27 @@ const PORT = process.env.PORT || 3001;
 const app = express();
 app.use(cors());
 
-let browser = null;
-let queue = Promise.resolve();
-
-async function getBrowser() {
-  if (!browser || !browser.isConnected()) {
-    if (browser) { try { await browser.close(); } catch {} browser = null; }
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-zygote",
-        "--single-process",
-        "--disable-extensions",
-      ],
-    });
-  }
-  return browser;
-}
+const LAUNCH_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-blink-features=AutomationControlled",
+];
 
 async function scrapeEbay(url) {
-  const b = await getBrowser();
-  const context = await b.newContext({
-    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    locale: "en-GB",
-    viewport: { width: 1280, height: 800 },
-    extraHTTPHeaders: { "Accept-Language": "en-GB,en;q=0.9" },
-  });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
-  });
-
-  const page = await context.newPage();
-
+  const browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
   try {
+    const context = await browser.newContext({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      locale: "en-GB",
+      viewport: { width: 1280, height: 800 },
+      extraHTTPHeaders: { "Accept-Language": "en-GB,en;q=0.9" },
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+    });
+    const page = await context.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForSelector("ul.srp-results", { timeout: 10000 }).catch(() => {});
 
@@ -77,15 +58,16 @@ async function scrapeEbay(url) {
       return results;
     });
   } finally {
-    try { await context.close(); } catch {}
+    await browser.close();
   }
 }
 
-// Run all scrapes sequentially to avoid browser crashes under concurrency
+// Global queue — serialise all scrapes to avoid RAM exhaustion
+let queue = Promise.resolve();
 function enqueue(fn) {
-  const result = queue.then(fn).catch((err) => { browser = null; throw err; });
-  queue = result.catch(() => {});
-  return result;
+  const next = queue.then(fn);
+  queue = next.catch(() => {});
+  return next;
 }
 
 app.get("/api/ebay-search", async (req, res) => {
@@ -98,7 +80,6 @@ app.get("/api/ebay-search", async (req, res) => {
 
   try {
     console.log(`[eBay] Searching: "${q}"`);
-    // Scrape sequentially via queue to keep browser stable
     const active = await enqueue(() => scrapeEbay(activeUrl));
     const sold   = await enqueue(() => scrapeEbay(soldUrl));
     console.log(`[eBay] Done: ${active.length} active, ${sold.length} sold`);
@@ -112,5 +93,3 @@ app.get("/api/ebay-search", async (req, res) => {
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => console.log(`eBay scraper → http://localhost:${PORT}`));
-
-process.on("SIGINT", async () => { if (browser) await browser.close(); process.exit(); });
