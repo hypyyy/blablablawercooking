@@ -15,6 +15,10 @@ let browser = null;
 
 async function getBrowser() {
   if (!browser || !browser.isConnected()) {
+    if (browser) {
+      try { await browser.close(); } catch {}
+      browser = null;
+    }
     browser = await chromium.launch({
       headless: true,
       args: [
@@ -32,8 +36,15 @@ async function getBrowser() {
   return browser;
 }
 
-async function scrapeEbay(url) {
-  const b = await getBrowser();
+async function scrapeEbay(url, retry = true) {
+  let b;
+  try {
+    b = await getBrowser();
+  } catch (err) {
+    browser = null;
+    if (retry) return scrapeEbay(url, false);
+    throw err;
+  }
   const context = await b.newContext({
     userAgent:
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -88,8 +99,12 @@ async function scrapeEbay(url) {
     });
 
     return listings;
+  } catch (err) {
+    browser = null;
+    if (retry) return scrapeEbay(url, false);
+    throw err;
   } finally {
-    await context.close();
+    try { await context.close(); } catch {}
   }
 }
 
